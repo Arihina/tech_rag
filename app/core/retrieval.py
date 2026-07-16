@@ -1,0 +1,262 @@
+from __future__ import annotations
+
+import re
+
+import numpy as np
+from qdrant_client import QdrantClient, models
+from rank_bm25 import BM25Okapi
+from sentence_transformers import SentenceTransformer
+
+from app.core.config import settings
+
+
+QDRANT_COLLECTION = settings.QDRANT_COLLECTION
+EMBED_MODEL = settings.EMBED_MODEL
+
+QUERY_PREFIX = "query: "
+
+RETRIEVAL_THRESHOLD = 0.35
+RETRIEVAL_TOP_K = 10
+RRF_K = 60
+DEDUP_THRESHOLD = 0.85
+
+CHUNK_TYPE_BOOST: dict[str, float] = {
+    "paragraph": 0.00,
+    "table": 0.03,
+    "code": 0.04,
+    "heading": -0.05,
+}
+
+
+type DocResult = dict
+
+
+embed_model = SentenceTransformer(EMBED_MODEL)
+qdrant_client = QdrantClient(
+    url=settings.qdrant_url,
+    api_key=settings.QDRANT_API_KEY,
+    prefer_grpc=settings.QDRANT_PREFER_GRPC,
+)
+
+documents: list[str] = []
+metadatas: list[dict] = []
+point_ids: list[str] = []
+bm25: BM25Okapi | None = None
+
+
+def _tokenize(text: str) -> list[str]:
+    return re.sub(r"[^\w\s]", " ", text.lower()).split()
+
+
+def _enrich_text(text: str, meta: dict) -> str:
+    section = meta.get("section", "").strip()
+    if section and section not in text:
+        return f"{section}\n{text}"
+    return text
+
+
+def _load_corpus() -> None:
+    """Постранично вычитывает всю коллекцию Qdrant в память для BM25.
+
+    Аналог result = collection.get(...) в epoz. Qdrant не отдаёт всё одним
+    вызовом — используется scroll с курсором (next_page_offset).
+    """
+    global documents, metadatas, point_ids
+
+    documents, metadatas, point_ids = [], [], []
+
+    try:
+        if not qdrant_client.collection_exists(QDRANT_COLLECTION):
+            print(f"[retrieval] Коллекция '{QDRANT_COLLECTION}' не существует "
+                  f"— запустите index_qdrant.py")
+            return
+
+        offset = None
+        while True:
+            points, offset = qdrant_client.scroll(
+                collection_name=QDRANT_COLLECTION,
+                limit=512,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            for p in points:
+                payload = p.payload or {}
+                documents.append(payload.get("text", ""))
+                metadatas.append(payload)
+                point_ids.append(str(p.id))
+            if offset is None:
+                break
+
+        print(f"[retrieval] Загружено {len(documents)} чанков из Qdrant "
+              f"('{QDRANT_COLLECTION}')")
+    except Exception as exc:
+        # Qdrant может быть временно недоступен на старте процесса —
+        # сервис должен подняться в деградированном режиме (без BM25),
+        # а не упасть целиком при импорте модуля (как в epoz с ChromaDB).
+        print(f"[retrieval] Ошибка загрузки из Qdrant: {exc}")
+        documents, metadatas, point_ids = [], [], []
+
+
+def _init_bm25() -> None:
+    global bm25
+
+    _load_corpus()
+
+    if documents:
+        enriched = [_enrich_text(doc, meta)
+                    for doc, meta in zip(documents, metadatas)]
+        tokenized = [_tokenize(t) for t in enriched]
+        bm25 = BM25Okapi(tokenized)
+        print("[retrieval] BM25-индекс создан")
+    else:
+        bm25 = None
+        print("[retrieval] Предупреждение: BM25-индекс не создан — нет документов")
+
+
+_init_bm25()
+
+
+def reload_corpus() -> None:
+    """Пересобрать BM25-индекс и локальный кэш после переиндексации Qdrant."""
+    _init_bm25()
+
+
+def _chunk_score_boost(meta: dict) -> float:
+    chunk_type = meta.get("chunk_type", "paragraph")
+    return CHUNK_TYPE_BOOST.get(chunk_type, 0.0)
+
+
+def _jaccard(a: str, b: str) -> float:
+    sa, sb = set(_tokenize(a)), set(_tokenize(b))
+    if not sa and not sb:
+        return 1.0
+    return len(sa & sb) / len(sa | sb)
+
+
+def _deduplicate(results: list[DocResult]) -> list[DocResult]:
+    if len(results) <= 1:
+        return results
+
+    kept: list[DocResult] = []
+    for candidate in results:
+        is_dup = False
+        for i, existing in enumerate(kept):
+            if candidate["source"] != existing["source"]:
+                continue
+            if _jaccard(candidate["text"], existing["text"]) >= DEDUP_THRESHOLD:
+                # code важнее по формату, чем обычный md-параграф — при
+                # совпадении оставляем более информативный вариант
+                if (candidate.get("chunk_type") == "code"
+                        and existing.get("chunk_type") != "code"):
+                    kept[i] = candidate
+                is_dup = True
+                break
+        if not is_dup:
+            kept.append(candidate)
+
+    return kept
+
+
+def _bm25_search(query: str, top_k: int = RETRIEVAL_TOP_K) -> list[DocResult]:
+    if bm25 is None or not documents:
+        return []
+
+    tokens = _tokenize(query)
+    scores = bm25.get_scores(tokens)
+    ranked = np.argsort(scores)[::-1][:top_k]
+
+    results: list[DocResult] = []
+    for idx in ranked:
+        score = float(scores[idx])
+        if score <= 0:
+            continue
+        meta = metadatas[idx] if idx < len(metadatas) else {}
+        results.append({
+            "text": documents[idx],
+            "source": meta.get("source", "unknown"),
+            "chunk_id": point_ids[idx] if idx < len(point_ids) else str(idx),
+            "score": score,
+            "chunk_type": meta.get("chunk_type", ""),
+            "section": meta.get("section", ""),
+            "_meta": meta,
+        })
+
+    return results
+
+
+def _vector_search(query: str, top_k: int = RETRIEVAL_TOP_K) -> list[DocResult]:
+    try:
+        embedding = embed_model.encode(
+            [QUERY_PREFIX + query],
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+        )[0].tolist()
+
+        hits = qdrant_client.query_points(
+            collection_name=QDRANT_COLLECTION,
+            query=embedding,
+            limit=top_k * 2,
+            with_payload=True,
+        ).points
+
+        results: list[DocResult] = []
+        for hit in hits:
+            score = float(hit.score)
+            if score < RETRIEVAL_THRESHOLD:
+                continue
+            meta = hit.payload or {}
+            results.append({
+                "text":          meta.get("text", ""),
+                "source":        meta.get("source", "unknown"),
+                "chunk_id":      str(hit.id),
+                "score":         score,
+                "chunk_type":    meta.get("chunk_type", ""),
+                "section":       meta.get("section", ""),
+                "_meta":         meta,
+            })
+            
+        return results
+
+    except Exception as exc:
+        print(f"[retrieval] Qdrant query error: {exc}")
+        return []
+
+
+def _rrf_merge(
+    vector_results: list[DocResult],
+    bm25_results:   list[DocResult],
+    top_k:          int,
+) -> list[DocResult]:
+    merged: dict[str, DocResult] = {}
+
+    for rank, r in enumerate(vector_results):
+        key = r["chunk_id"]
+        rrf = 1.0 / (RRF_K + rank + 1)
+        if key not in merged:
+            merged[key] = {**r, "score": 0.0}
+        merged[key]["score"] += rrf
+
+    for rank, r in enumerate(bm25_results):
+        key = r["chunk_id"]
+        rrf = 1.0 / (RRF_K + rank + 1)
+        if key not in merged:
+            merged[key] = {**r, "score": 0.0}
+        merged[key]["score"] += rrf
+
+    for r in merged.values():
+        r["score"] += _chunk_score_boost(r.get("_meta", {}))
+
+    ranked = sorted(merged.values(), key=lambda x: x["score"], reverse=True)
+    deduped = _deduplicate(ranked)
+
+    for r in deduped:
+        r.pop("_meta", None)
+
+    return deduped[:top_k]
+
+
+def retrieve(query: str, top_k: int = RETRIEVAL_TOP_K) -> list[DocResult]:
+    vector = _vector_search(query, top_k * 2)
+    bm25_ = _bm25_search(query, top_k * 2)
+    return _rrf_merge(vector, bm25_, top_k)
