@@ -321,18 +321,18 @@ data: [DONE]
 U=11111111-1111-1111-1111-111111111111
  
 # --- генерация, без привязки к чату ---
-curl -k -X POST http://localhost:8001/v1/chat/completions \
+curl -k -X POST http://localhost:8004/v1/chat/completions \
   -H "X-User-Id: $U" -H "Content-Type: application/json" \
   -d '{"model": "tech_rag", "messages": [{"role": "user", "content": "что такое Меры ограничительного характера"}]}'
 # -> {"id": "chatcmpl-...", "object": "chat.completion", "choices": [...], "usage": {...}}
  
 # то же самое, стримом
-curl -k -N -X POST http://localhost:8001/v1/chat/completions \
+curl -k -N -X POST http://localhost:8004/v1/chat/completions \
   -H "X-User-Id: $U" -H "Content-Type: application/json" \
   -d '{"model": "tech_rag", "stream": true, "messages": [{"role": "user", "content": "что такое РАГ"}]}'
  
 # продолжение диалога — история целиком в теле
-curl -k -X POST http://localhost:8001/v1/chat/completions \
+curl -k -X POST http://localhost:8004/v1/chat/completions \
   -H "X-User-Id: $U" -H "Content-Type: application/json" \
   -d '{"model": "tech_rag", "messages": [
         {"role": "user", "content": "что такое РАГ"},
@@ -343,63 +343,63 @@ curl -k -X POST http://localhost:8001/v1/chat/completions \
 ID=chatcmpl-1e6b7ee7-d5bb-4f0a-8f9e-a06f19a8f3c2
  
 # получить ответ повторно по id (например, если клиент потерял тело исходного ответа)
-curl -k http://localhost:8001/v1/chat/completions/$ID -H "X-User-Id: $U"
+curl -k http://localhost:8004/v1/chat/completions/$ID -H "X-User-Id: $U"
  
 # источники
-curl -k http://localhost:8001/v1/chat/completions/$ID/sources -H "X-User-Id: $U"
+curl -k http://localhost:8004/v1/chat/completions/$ID/sources -H "X-User-Id: $U"
  
 # --- фидбэк ---
  
 # поставить оценку
-curl -k -X POST http://localhost:8001/v1/chat/completions/$ID/feedback \
+curl -k -X POST http://localhost:8004/v1/chat/completions/$ID/feedback \
   -H "X-User-Id: $U" -H "Content-Type: application/json" \
   -d '{"vote": 1, "comment": "Хороший ответ"}'
  
 # посмотреть текущую оценку
-curl -k http://localhost:8001/v1/chat/completions/$ID/feedback -H "X-User-Id: $U"
+curl -k http://localhost:8004/v1/chat/completions/$ID/feedback -H "X-User-Id: $U"
  
 # сбросить оценку
-curl -k -X DELETE http://localhost:8001/v1/chat/completions/$ID/feedback -H "X-User-Id: $U"
+curl -k -X DELETE http://localhost:8004/v1/chat/completions/$ID/feedback -H "X-User-Id: $U"
  
 # --- чаты (платформенный CRUD) ---
  
 # создать чат
-curl -k -X POST http://localhost:8001/v1/platform/conversations \
+curl -k -X POST http://localhost:8004/v1/platform/conversations \
   -H "X-User-Id: $U" -H "Content-Type: application/json" -d '{"title": "Тестовый чат"}'
 # -> {"id": "3fa85f64-5717-4562-b3fc-2c963f66afa6", ...}
  
 CID=3fa85f64-5717-4562-b3fc-2c963f66afa6
  
 # сообщение внутри чата — conversation_id привязывает запись к нему
-curl -k -X POST http://localhost:8001/v1/chat/completions \
+curl -k -X POST http://localhost:8004/v1/chat/completions \
   -H "X-User-Id: $U" -H "Content-Type: application/json" \
   -d "{\"model\": \"tech_rag\", \"conversation_id\": \"$CID\", \"messages\": [{\"role\": \"user\", \"content\": \"что такое РАГ\"}]}"
  
 # список чатов
-curl -k http://localhost:8001/v1/platform/conversations -H "X-User-Id: $U"
+curl -k http://localhost:8004/v1/platform/conversations -H "X-User-Id: $U"
  
 # история сообщений чата
-curl -k http://localhost:8001/v1/platform/conversations/$CID/messages -H "X-User-Id: $U"
+curl -k http://localhost:8004/v1/platform/conversations/$CID/messages -H "X-User-Id: $U"
  
 # переименовать / удалить
-curl -k -X PATCH http://localhost:8001/v1/platform/conversations/$CID \
+curl -k -X PATCH http://localhost:8004/v1/platform/conversations/$CID \
   -H "X-User-Id: $U" -H "Content-Type: application/json" -d '{"title": "Новое название"}'
-curl -k -X DELETE http://localhost:8001/v1/platform/conversations/$CID -H "X-User-Id: $U"
+curl -k -X DELETE http://localhost:8004/v1/platform/conversations/$CID -H "X-User-Id: $U"
  
 # --- ошибки ---
  
 # без X-User-Id -> 401 в едином формате
-curl -k -X POST http://localhost:8001/v1/chat/completions \
+curl -k -X POST http://localhost:8004/v1/chat/completions \
   -H "Content-Type: application/json" -d '{"messages": [{"role": "user", "content": "привет"}]}'
 # -> {"error": {"message": "...", "type": "authentication_error", "param": null, "code": null}}
  
 # чужой/несуществующий completion_id -> 404
-curl -k http://localhost:8001/v1/chat/completions/chatcmpl-00000000-0000-0000-0000-000000000000/sources \
+curl -k http://localhost:8004/v1/chat/completions/chatcmpl-00000000-0000-0000-0000-000000000000/sources \
   -H "X-User-Id: $U"
 # -> {"error": {"message": "Сообщение не найдено", "type": "not_found_error", "param": null, "code": null}}
  
 # пустой messages -> 422
-curl -k -X POST http://localhost:8001/v1/chat/completions \
+curl -k -X POST http://localhost:8004/v1/chat/completions \
   -H "X-User-Id: $U" -H "Content-Type: application/json" -d '{"messages": []}'
 # -> {"error": {"message": "messages обязателен и не должен быть пустым", "type": "invalid_request_error", "param": null, "code": null}}
 ```
