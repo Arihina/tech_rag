@@ -56,11 +56,6 @@ def _enrich_text(text: str, meta: dict) -> str:
 
 
 def _load_corpus() -> None:
-    """Постранично вычитывает всю коллекцию Qdrant в память для BM25.
-
-    Аналог result = collection.get(...) в epoz. Qdrant не отдаёт всё одним
-    вызовом — используется scroll с курсором (next_page_offset).
-    """
     global documents, metadatas, point_ids
 
     documents, metadatas, point_ids = [], [], []
@@ -91,9 +86,6 @@ def _load_corpus() -> None:
         print(f"[retrieval] Загружено {len(documents)} чанков из Qdrant "
               f"('{QDRANT_COLLECTION}')")
     except Exception as exc:
-        # Qdrant может быть временно недоступен на старте процесса —
-        # сервис должен подняться в деградированном режиме (без BM25),
-        # а не упасть целиком при импорте модуля (как в epoz с ChromaDB).
         print(f"[retrieval] Ошибка загрузки из Qdrant: {exc}")
         documents, metadatas, point_ids = [], [], []
 
@@ -118,7 +110,6 @@ _init_bm25()
 
 
 def reload_corpus() -> None:
-    """Пересобрать BM25-индекс и локальный кэш после переиндексации Qdrant."""
     _init_bm25()
 
 
