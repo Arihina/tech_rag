@@ -19,6 +19,8 @@ class Settings(BaseSettings):
     OLLAMA_MODEL: str = "qwen3.6:35b"
     OLLAMA_HOST: str = "http://localhost:11434"
 
+    HISTORY_LIMIT: int = 10
+
     @property
     def db_url(self) -> str:
         return (
