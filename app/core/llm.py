@@ -6,10 +6,12 @@ from app.core.retrieval import retrieve, DocResult
 from app.core.config import settings
 
 
+OLLAMA_HOST = "http://localhost:11434"
 OLLAMA_MODEL = settings.OLLAMA_MODEL
 RAG_MIN_SCORE = 0.013
 
-_client = ollama.Client(host=settings.OLLAMA_HOST)
+
+_client = ollama.Client(host=OLLAMA_HOST)
 
 
 _SMALL_TALK_PATTERNS = (
@@ -33,13 +35,23 @@ def _format_history(history: list[tuple[str, str]], max_turns: int = 10) -> str:
     return "\n".join(lines)
 
 
-def _general_prompt(history: list[tuple[str, str]], question: str) -> str:
-    return f"""Ты русскоязычный AI ассистент по технической документации.
+def _instructions_block(instructions: str | None) -> str:
+    if not instructions or not instructions.strip():
+        return ""
+    return f"\nДополнительные инструкции пользователя:\n{instructions.strip()}\n"
+
+
+def _general_prompt(
+    history: list[tuple[str, str]],
+    question: str,
+    instructions: str | None = None,
+) -> str:
+    return f"""Ты русскоязычный AI ассистент.
 Отвечай ТОЛЬКО на русском языке.
-Это общий вопрос, не связанный с документацией.
+Это общий вопрос, не связанный с документами.
 Отвечай свободно, как обычный ассистент.
 Источники указывать НЕ НУЖНО.
-
+{_instructions_block(instructions)}
 Предыдущий диалог:
 {_format_history(history)}
 
@@ -53,16 +65,16 @@ def _rag_prompt(
     docs: list[DocResult],
     history: list[tuple[str, str]],
     question: str,
+    instructions: str | None = None,
 ) -> str:
     context = "\n\n".join(
         f"[Источник {i}]\n{d['text']}" for i, d in enumerate(docs, 1)
     )
-    return f"""Ты русскоязычный AI ассистент по технической документации.
+    return f"""Ты русскоязычный AI ассистент.
 Отвечай ТОЛЬКО на русском языке.
 Используй ТОЛЬКО ту информацию из контекста, которая действительно нужна для ответа.
-Если в контексте есть код или команды — приводи их точно, без изменений, в блоках кода.
 Если информация не использовалась — НЕ УПОМИНАЙ источник.
-
+{_instructions_block(instructions)}
 Контекст:
 {context}
 
@@ -85,20 +97,26 @@ def find_used_sources(answer: str, docs: list[DocResult]) -> list[str]:
     return sorted(used)
 
 
+def _retrieval_query(question: str) -> str:
+    return question.replace("?", "").strip()
+
+
 def stream_answer(
     question: str,
     history: list[tuple[str, str]],
+    instructions: str | None = None,
+    options: dict | None = None,
 ) -> Generator[tuple[str, list[str] | None, list[DocResult] | None, dict | None], None, None]:
     if is_small_talk(question):
-        prompt = _general_prompt(history, question)
+        prompt = _general_prompt(history, question, instructions)
         docs = None
     else:
-        docs = retrieve(question)
+        docs = retrieve(_retrieval_query(question))
         if not docs or docs[0]["score"] < RAG_MIN_SCORE:
-            prompt = _general_prompt(history, question)
+            prompt = _general_prompt(history, question, instructions)
             docs = None
         else:
-            prompt = _rag_prompt(docs, history, question)
+            prompt = _rag_prompt(docs, history, question, instructions)
 
     yield "", None, docs, None
 
@@ -106,6 +124,7 @@ def stream_answer(
         model=OLLAMA_MODEL,
         messages=[{"role": "user", "content": prompt}],
         stream=True,
+        options=options or None,
     )
     full_answer = ""
     prompt_tokens = 0
