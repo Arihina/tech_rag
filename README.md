@@ -62,7 +62,7 @@ QDRANT_COLLECTION=techdocs_hybrid
 # --- Модели ---
 EMBED_MODEL=intfloat/multilingual-e5-small
 OLLAMA_MODEL=gemma2:9b
-OLLAMA_HOST=http://localhost:11434
+OLLAMA_HOST=http://localhost:11434   # читается приложением; в docker-развёртывании — имя сервиса, а не localhost
 ```
 
 Запуск сервиса:
@@ -145,10 +145,13 @@ JWT валидирует мастер-агент; RAG доверяет внут�
 
 ## API — общая идея
 
-API состоит из двух независимых частей:
+API состоит из трёх частей:
 
-- **`/v1/chat/completions`** — OpenAI-совместимый эндпоинт генерации. **Полностью stateless**: сервис не хранит и не переиспользует историю диалога — клиент присылает её целиком в `messages[]` при каждом запросе. Формат запроса/ответа соответствует `chat.completion` / `chat.completion.chunk` из OpenAI Chat Completions API.
-- **`/v1/platform/conversations`** — платформенное (не входящее в OpenAI-стандарт) расширение для UI: список чатов, история сообщений, переименование, удаление. Не участвует в генерации и не хранит контекст для модели — это только группировка сообщений для отображения. Связь между двумя частями — необязательное поле `conversation_id` в теле запроса к `/v1/chat/completions`.
+- **`/v1/chat/completions`** — форма OpenAI Chat Completions. **Полностью stateless**: сервис не хранит и не переиспользует историю диалога — клиент присылает её целиком в `messages[]` при каждом запросе. Формат запроса/ответа соответствует `chat.completion` / `chat.completion.chunk`.
+- **`/v1/responses`** — форма OpenAI Responses API. Та же генерация, другой формат: объект `response` с массивом `output` вместо `choices`, стрим — типизированными SSE-событиями вместо чанков. В отличие от Chat Completions, умеет работать с историей на стороне сервера: при переданном `conversation` (или `previous_response_id`) историю собирает сам агент из БД.
+- **`/v1/platform/conversations`**, **`.../feedback`**, **`.../sources`** — платформенные (не входящие в OpenAI-стандарт) расширения для UI: список чатов, история сообщений, оценка ответа, извлечённые фрагменты. Связь с формами генерации — поле `conversation_id` в теле запроса и `id` ответа как ключ для фидбэка и источников.
+
+Обе формы совместимы с официальным SDK: `OpenAI(base_url=..., default_headers={"X-User-Id": ...})`, дальше `client.chat.completions.create(...)` или `client.responses.create(...)`. Совместимость проверяется тестом `test_openai_conformance.py`, который валидирует реальные ответы обеих форм против pydantic-моделей `openai-python`.
 
 
 ## API
@@ -175,9 +178,17 @@ API состоит из двух независимых частей:
 | Поле | Тип | Обязательно | Описание |
 |---|---|---|---|
 | `model` | string | нет (по умолчанию `"tech_rag"`) | не влияет на поведение, только эхом в ответе |
-| `messages` | array | да | последнее сообщение — `role: "user"`, это и есть текущий вопрос |
+| `messages` | array | да | последнее сообщение — `role: "user"`, это и есть текущий вопрос. `content` принимается и строкой, и массивом частей (`{"type": "text", ...}`) |
 | `stream` | bool | нет (по умолчанию `false`) | стримить ответ через SSE |
+| `stream_options.include_usage` | bool | нет | добавить в конец стрима чанк с `usage` и пустым `choices` |
+| `temperature`, `top_p` | number | нет | передаются модели как есть |
+| `max_tokens` / `max_completion_tokens` | int | нет | ограничение длины ответа (`num_predict` для Ollama) |
+| `n` | int | нет | поддерживается только `1`; другое значение → `400`, а не тихий возврат одного варианта |
 | `conversation_id` | UUID string | нет | платформенное расширение — привязать сообщение к чату из `/v1/platform/conversations`. Чужой/несуществующий `conversation_id` → `404` |
+
+Сообщения с `role: "system"` / `"developer"` попадают в промпт как дополнительные инструкции пользователя: они уточняют поведение, но не отменяют базовые правила сервиса (язык ответа, работа с источниками).
+
+**Не поддерживаются** (молча игнорируются): `tools`, `tool_choice`, `response_format`, `seed`, `logprobs`, `logit_bias`, `presence_penalty`, `frequency_penalty`, `stop`, `user`, `service_tier`.
 
 **Нестрим-ответ** (`chat.completion`):
 ```json
@@ -187,9 +198,16 @@ API состоит из двух независимых частей:
   "created": 1735900000,
   "model": "tech_rag",
   "conversation_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+  "system_fingerprint": null,
   "choices": [{
     "index": 0,
-    "message": {"role": "assistant", "content": "РАГ (Retrieval-Augmented Generation) — это...\n\nИсточники:\n- doc1.pdf"},
+    "message": {
+      "role": "assistant",
+      "content": "РАГ (Retrieval-Augmented Generation) — это...\n\nПроанализированные источники:\n- doc1.pdf",
+      "refusal": null,
+      "annotations": []
+    },
+    "logprobs": null,
     "finish_reason": "stop"
   }],
   "usage": {"prompt_tokens": 412, "completion_tokens": 87, "total_tokens": 499}
@@ -206,7 +224,124 @@ data: {"id":"chatcmpl-...","object":"chat.completion.chunk","created":1735900000
 
 data: [DONE]
 ```
-`conversation_id` в ответе — `null`, если не был передан в запросе. `id` (`chatcmpl-<uuid>`) — ключ для фидбэка и источников ниже. Блок «Источники: ...» добавляется в `content` в конце ответа, если ассистент использовал извлечённые фрагменты (как обычный текст, не отдельным полем).
+`conversation_id` в ответе — `null`, если не был передан в запросе. `id` (`chatcmpl-<uuid>`) — ключ для фидбэка, источников, повторного чтения и удаления. Блок «Проанализированные источники: ...» добавляется в `content` в конце ответа, если ассистент использовал извлечённые фрагменты (как обычный текст, не отдельным полем) — одинаково в стриме и без него, и одинаково в обеих формах.
+
+Поля `system_fingerprint`, `refusal`, `annotations`, `logprobs` сервис не наполняет, но возвращает: они входят в объект по спецификации, и часть клиентов на них закладывается.
+
+---
+
+### `GET /v1/chat/completions/{completion_id}`
+
+Повторное чтение сохранённого ответа. Возвращает тот же объект `chat.completion`, что и генерация. `{completion_id}` — `chatcmpl-<uuid>` целиком или голый UUID. Чужой или несуществующий id → `404`, синтаксически некорректный → `400`.
+
+---
+
+### `DELETE /v1/chat/completions/{completion_id}`
+
+Удаляет сообщение ассистента вместе с его фидбэком (каскад по FK):
+```json
+{"id": "chatcmpl-1e6b7ee7-d5bb-4f0a-8f9e-a06f19a8f3c2", "object": "chat.completion.deleted", "deleted": true}
+```
+Реплика пользователя, вызвавшая ответ, **остаётся** в чате: id адресует именно объект completion, а связи «ответ → вопрос» в схеме нет — сообщения связаны только чатом и порядком `created_at`. Чтобы убрать оба сообщения, удаляйте чат целиком через `/v1/platform/conversations/{id}`.
+
+---
+
+### `POST /v1/responses`
+
+Та же генерация в форме Responses API. Два режима работы в зависимости от того, передан ли чат:
+
+- **без `conversation`** — stateless, как Chat Completions: вся история приходит в `input[]`;
+- **с `conversation`** — историю собирает агент из БД (последние `HISTORY_LIMIT` сообщений чата), а `input` должен содержать **только новый ход**.
+
+Тело запроса:
+```json
+{
+  "model": "tech_rag",
+  "input": [
+    {"role": "user", "content": [{"type": "input_text", "text": "что такое РАГ"}]}
+  ],
+  "instructions": "Отвечай кратко",
+  "stream": true,
+  "conversation": "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+}
+```
+| Поле | Тип | Обязательно | Описание |
+|---|---|---|---|
+| `model` | string | нет (по умолчанию `"tech_rag"`) | эхом в ответе |
+| `input` | string \| array | да | строка либо список items; последний — `role: "user"` |
+| `instructions` | string | нет | дополнительные инструкции; кладутся в промпт после базовых правил сервиса |
+| `stream` | bool | нет | стримить типизированными SSE-событиями |
+| `store` | bool | нет (по умолчанию `true`) | `false` — не сохранять ответ в БД; тогда `GET /v1/responses/{id}` по нему вернёт `404`, а фидбэк и источники будут недоступны |
+| `temperature`, `top_p`, `max_output_tokens` | number/int | нет | передаются модели |
+| `conversation` | string \| `{"id": ...}` | нет | чат из `/v1/platform/conversations`. `conversation_id` принимается как алиас — для фронта платформы; официальный SDK такого именованного аргумента не знает и отправил бы его только через `extra_body` |
+| `previous_response_id` | string | нет | стандартный способ продолжить цепочку: агент находит предыдущий ответ и берёт чат, которому тот принадлежал. Неизвестный или чужой id → `404` |
+| `metadata` | object | нет | не используется, возвращается эхом |
+
+**Не поддерживаются**: `tools`, `text.format`, `reasoning`, `include`, `background`, `truncation`.
+
+Если при переданном `conversation` в `input` всё-таки пришла история — `400`. Это сознательное отступление от спецификации OpenAI (там `conversation` вместе с многоходовым `input` допустим, история просто дополняется): предпочитаем явную ошибку риску удвоить контекст.
+
+**Нестрим-ответ** (`response`):
+```json
+{
+  "id": "resp_1e6b7ee7-d5bb-4f0a-8f9e-a06f19a8f3c2",
+  "object": "response",
+  "created_at": 1735900000,
+  "status": "completed",
+  "model": "tech_rag",
+  "output": [{
+    "id": "msg_1e6b7ee7-d5bb-4f0a-8f9e-a06f19a8f3c2",
+    "type": "message",
+    "status": "completed",
+    "role": "assistant",
+    "content": [{"type": "output_text", "text": "РАГ — это...", "annotations": [], "logprobs": []}]
+  }],
+  "parallel_tool_calls": false,
+  "tool_choice": "auto",
+  "tools": [],
+  "error": null,
+  "incomplete_details": null,
+  "instructions": null,
+  "metadata": {},
+  "temperature": null,
+  "top_p": null,
+  "max_output_tokens": null,
+  "previous_response_id": null,
+  "store": true,
+  "truncation": "disabled",
+  "text": {"format": {"type": "text"}},
+  "conversation_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+  "usage": {
+    "input_tokens": 412,
+    "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+    "output_tokens": 87,
+    "output_tokens_details": {"reasoning_tokens": 0},
+    "total_tokens": 499
+  }
+}
+```
+Поля `parallel_tool_calls`, `tool_choice`, `tools` и подобъекты `*_tokens_details` обязательны в объекте `response` — без них официальный SDK не разбирает ответ, даже если инструменты не поддерживаются. `conversation_id` — расширение платформы, остальное — из спецификации.
+
+**Стрим-ответ** (`stream: true`) — SSE с типом в поле `event` и монотонным `sequence_number`:
+```
+event: response.created          # объект response со status: "in_progress"
+event: response.in_progress
+event: response.output_item.added
+event: response.content_part.added
+event: response.output_text.delta   # по одному на токен
+...
+event: response.output_text.done
+event: response.content_part.done
+event: response.output_item.done
+event: response.completed        # объект response со status: "completed" и usage
+```
+Терминатора `[DONE]` здесь нет — в отличие от Chat Completions, поток закрывается событием `response.completed`. При ошибке во время генерации приходит событие `error` со следующим по порядку `sequence_number`.
+
+---
+
+### `GET /v1/responses/{response_id}` и `DELETE /v1/responses/{response_id}`
+
+Чтение и удаление — так же, как для Chat Completions выше, но объект `response`, а `deleted`-ответ — `{"id": ..., "object": "response.deleted", "deleted": true}`. Идентификаторы взаимозаменяемы: обе формы адресуют одно и то же сообщение в БД, поэтому ответ, созданный через `/v1/responses`, читается и через `/v1/chat/completions/{id}` (и наоборот) — префикс `resp_` / `chatcmpl-` при разборе отбрасывается.
 
 ---
 
@@ -313,6 +448,8 @@ data: [DONE]
 ```
 `type` — грубая классификация по HTTP-статусу: `400/413/415/422` → `invalid_request_error`, `401` → `authentication_error`, `404` → `not_found_error`, остальное → `server_error`.
 
+Невалидное тело запроса — **`400`**, а не `422`: OpenAI отвечает на такие запросы именно `400`, а SDK мапит `422` в `UnprocessableEntityError`, мимо клиентского `except BadRequestError`. Поле `param` заполняется путём до проблемного поля (`messages.0.role`), а не остаётся `null`.
+
 ---
 
 ## Примеры curl
@@ -398,7 +535,24 @@ curl -k http://localhost:8004/v1/chat/completions/chatcmpl-00000000-0000-0000-00
   -H "X-User-Id: $U"
 # -> {"error": {"message": "Сообщение не найдено", "type": "not_found_error", "param": null, "code": null}}
  
-# пустой messages -> 422
+# --- форма Responses ---
+curl -k -X POST http://localhost:8004/v1/responses \
+  -H "X-User-Id: $U" -H "Content-Type: application/json" \
+  -d '{"model": "tech_rag", "input": "что такое РАГ"}'
+
+# продолжение цепочки стандартным способом
+RID=$(curl -sk -X POST http://localhost:8004/v1/responses \
+  -H "X-User-Id: $U" -H "Content-Type: application/json" \
+  -d "{\"conversation\": \"$CID\", \"input\": \"что такое РАГ\"}" | jq -r .id)
+curl -k -X POST http://localhost:8004/v1/responses \
+  -H "X-User-Id: $U" -H "Content-Type: application/json" \
+  -d "{\"previous_response_id\": \"$RID\", \"input\": \"а какие сроки\"}"
+
+# удаление ответа (фидбэк уходит каскадом)
+curl -k -X DELETE http://localhost:8004/v1/responses/$RID -H "X-User-Id: $U"
+# -> {"id": "resp_...", "object": "response.deleted", "deleted": true}
+
+# пустой messages -> 400
 curl -k -X POST http://localhost:8004/v1/chat/completions \
   -H "X-User-Id: $U" -H "Content-Type: application/json" -d '{"messages": []}'
 # -> {"error": {"message": "messages обязателен и не должен быть пустым", "type": "invalid_request_error", "param": null, "code": null}}

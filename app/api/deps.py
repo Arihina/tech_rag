@@ -9,7 +9,7 @@ from app.core.auth import get_user_id
 
 def parse_completion_id(completion_id: str) -> UUID:
     raw = completion_id
-    
+
     for prefix in ("chatcmpl-", "resp_"):
         if raw.startswith(prefix):
             raw = raw[len(prefix):]
@@ -17,7 +17,7 @@ def parse_completion_id(completion_id: str) -> UUID:
     try:
         return UUID(raw)
     except ValueError:
-        raise HTTPException(422, "Некорректный id completion'а")
+        raise HTTPException(400, "Некорректный id completion'а")
 
 
 async def get_owned_completion(

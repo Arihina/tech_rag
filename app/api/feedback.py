@@ -33,7 +33,7 @@ async def set_feedback(
     raw_vote = body.get("vote", _MISSING)
     comment: Optional[str] = body.get("comment", _MISSING)
     if raw_vote is not _MISSING and raw_vote not in (1, -1, None):
-        raise HTTPException(422, "vote должен быть 1, -1 или null")
+        raise HTTPException(400, "vote должен быть 1, -1 или null")
     if msg.role != "assistant":
         raise HTTPException(400, "Оценивать можно только ответы ассистента")
     fb = await crud.upsert_feedback(

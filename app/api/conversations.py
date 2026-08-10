@@ -64,8 +64,8 @@ async def rename_conversation(
 ):
     title = body.get("title", "").strip()
     if not title:
-        raise HTTPException(422, "title не может быть пустым")
-    
+        raise HTTPException(400, "title не может быть пустым")
+
     return _fmt_conversation(await crud.rename_conversation(db, c, title))
 
 

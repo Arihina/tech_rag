@@ -6,7 +6,7 @@ from app.core.retrieval import retrieve, DocResult
 from app.core.config import settings
 
 
-OLLAMA_HOST = "http://localhost:11434"
+OLLAMA_HOST = settings.OLLAMA_HOST
 OLLAMA_MODEL = settings.OLLAMA_MODEL
 RAG_MIN_SCORE = 0.013
 
