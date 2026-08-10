@@ -31,7 +31,7 @@ CHUNK_TYPE_BOOST: dict[str, float] = {
 type DocResult = dict
 
 
-embed_model = SentenceTransformer(EMBED_MODEL)
+embed_model = SentenceTransformer(EMBED_MODEL, local_files_only=True)
 qdrant_client = QdrantClient(
     url=settings.qdrant_url,
     api_key=settings.QDRANT_API_KEY,
