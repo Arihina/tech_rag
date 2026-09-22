@@ -28,7 +28,7 @@ python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 
-sudo docker compose up -d   # поднимет Postgres (5435) и Qdrant (6333/6334)
+sudo docker compose up -d   # поднимет Postgres (5435) и Qdrant 6334
 
 alembic upgrade head
 ```
@@ -56,7 +56,7 @@ DB_NAME=techdocs_rag_db
 
 # --- Qdrant ---
 QDRANT_HOST=localhost
-QDRANT_PORT=6333
+QDRANT_PORT=6334
 QDRANT_COLLECTION=techdocs_hybrid
 
 # --- Модели ---
@@ -73,7 +73,7 @@ python3 main.py
 uvicorn main:app --host 127.0.0.1 --port 8004 --reload
 ```
 
-Веб-консоль Qdrant для отладки коллекции: `http://localhost:6333/dashboard`.
+Веб-консоль Qdrant для отладки коллекции: `http://localhost:6334/dashboard`.
 
 ## Модели
 
