@@ -17,7 +17,7 @@ services:
     volumes:
       - qdrant_data:/qdrant/storage
     ports:
-      - "6334:6333"
+      - "6335:6333"
 
 volumes:
   postgres_data:

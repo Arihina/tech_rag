@@ -28,7 +28,7 @@ python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 
-sudo docker compose up -d   # поднимет Postgres (5435) и Qdrant 6334
+sudo docker compose up -d   # поднимет Postgres (5435) и Qdrant 6335
 
 alembic upgrade head
 ```
