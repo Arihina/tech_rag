@@ -56,11 +56,11 @@ DB_NAME=techdocs_rag_db
 
 # --- Qdrant ---
 QDRANT_HOST=localhost
-QDRANT_PORT=6334
+QDRANT_PORT=6335
 QDRANT_COLLECTION=techdocs_hybrid
 
 # --- Модели ---
-EMBED_MODEL=intfloat/multilingual-e5-small
+EMBED_MODEL=BAAI/bge-m3
 OLLAMA_MODEL=gemma2:9b
 OLLAMA_HOST=http://localhost:11434   # читается приложением; в docker-развёртывании — имя сервиса, а не localhost
 ```
@@ -73,7 +73,7 @@ python3 main.py
 uvicorn main:app --host 127.0.0.1 --port 8004 --reload
 ```
 
-Веб-консоль Qdrant для отладки коллекции: `http://localhost:6334/dashboard`.
+Веб-консоль Qdrant для отладки коллекции: `http://localhost:6335/dashboard`.
 
 ## Модели
 
@@ -151,7 +151,7 @@ API состоит из трёх частей:
 - **`/v1/responses`** — форма OpenAI Responses API. Та же генерация, другой формат: объект `response` с массивом `output` вместо `choices`, стрим — типизированными SSE-событиями вместо чанков. В отличие от Chat Completions, умеет работать с историей на стороне сервера: при переданном `conversation` (или `previous_response_id`) историю собирает сам агент из БД.
 - **`/v1/platform/conversations`**, **`.../feedback`**, **`.../sources`** — платформенные (не входящие в OpenAI-стандарт) расширения для UI: список чатов, история сообщений, оценка ответа, извлечённые фрагменты. Связь с формами генерации — поле `conversation_id` в теле запроса и `id` ответа как ключ для фидбэка и источников.
 
-Обе формы совместимы с официальным SDK: `OpenAI(base_url=..., default_headers={"X-User-Id": ...})`, дальше `client.chat.completions.create(...)` или `client.responses.create(...)`. Совместимость проверяется тестом `test_openai_conformance.py`, который валидирует реальные ответы обеих форм против pydantic-моделей `openai-python`.
+Обе формы совместимы с официальным SDK: `OpenAI(base_url=..., default_headers={"X-User-Id": ...})`, дальше `client.chat.completions.create(...)` или `client.responses.create(...)`. Совместимость с pydantic-моделями `openai-python` должна проверяться conformance-тестами обеих форм (тест подключается отдельно).
 
 
 ## API

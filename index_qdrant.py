@@ -29,7 +29,6 @@ from chunking import (
     parse_file,
 )
 
-PASSAGE_PREFIX = ""
 
 DOC_EXTENSIONS = {".md", ".markdown", ".txt"}
 
@@ -75,7 +74,7 @@ def _upsert_chunks(
     if not chunks:
         return 0
 
-    texts = [PASSAGE_PREFIX + c["text"] for c in chunks]
+    texts = [c["text"] for c in chunks]
 
     embeddings = []
     for i in range(0, len(texts), 64):

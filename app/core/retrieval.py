@@ -13,8 +13,7 @@ from app.core.config import settings
 QDRANT_COLLECTION = settings.QDRANT_COLLECTION
 EMBED_MODEL = settings.EMBED_MODEL
 
-QUERY_PREFIX = "query: "
-
+# Используем только bge (bge-m3): префиксов query:/passage: bge не требует.
 RETRIEVAL_THRESHOLD = 0.35
 RETRIEVAL_TOP_K = 10
 RRF_K = 60
@@ -55,6 +54,35 @@ def _enrich_text(text: str, meta: dict) -> str:
     return text
 
 
+def _validate_dimension() -> None:
+    """Fail-fast при несовпадении размерности коллекции и модели.
+
+    Несовпадение (например, индекс построен моделью с размерностью 384, а
+    запросы идут bge-m3 1024) не даёт исключения в query-time — Qdrant
+    вернёт ошибку, а мы её поймаем и получим пустую выдачу. Здесь проверяем
+    заранее.
+    """
+    try:
+        if not qdrant_client.collection_exists(QDRANT_COLLECTION):
+            return
+        info = qdrant_client.get_collection(QDRANT_COLLECTION)
+        vectors = getattr(info.config.params, "vectors", None)
+        size = getattr(vectors, "size", None)
+        if size is None:
+            return
+        model_dim = int(embed_model.get_sentence_embedding_dimension())
+        if size != model_dim:
+            raise RuntimeError(
+                f"Коллекция '{QDRANT_COLLECTION}' имеет размерность {size}, "
+                f"а модель '{EMBED_MODEL}' — {model_dim}. Переиндексируйте "
+                f"коллекцию той же моделью (index_qdrant.py --reset)."
+            )
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        print(f"[retrieval] Не удалось проверить размерность коллекции: {exc}")
+
+
 def _load_corpus() -> None:
     global documents, metadatas, point_ids
 
@@ -93,6 +121,7 @@ def _load_corpus() -> None:
 def _init_bm25() -> None:
     global bm25
 
+    _validate_dimension()
     _load_corpus()
 
     if documents:
@@ -136,8 +165,6 @@ def _deduplicate(results: list[DocResult]) -> list[DocResult]:
             if candidate["source"] != existing["source"]:
                 continue
             if _jaccard(candidate["text"], existing["text"]) >= DEDUP_THRESHOLD:
-                # code важнее по формату, чем обычный md-параграф — при
-                # совпадении оставляем более информативный вариант
                 if (candidate.get("chunk_type") == "code"
                         and existing.get("chunk_type") != "code"):
                     kept[i] = candidate
@@ -179,7 +206,7 @@ def _bm25_search(query: str, top_k: int = RETRIEVAL_TOP_K) -> list[DocResult]:
 def _vector_search(query: str, top_k: int = RETRIEVAL_TOP_K) -> list[DocResult]:
     try:
         embedding = embed_model.encode(
-            [QUERY_PREFIX + query],
+            [query],
             convert_to_numpy=True,
             normalize_embeddings=True,
         )[0].tolist()
