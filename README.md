@@ -61,8 +61,16 @@ QDRANT_COLLECTION=techdocs_hybrid
 
 # --- Модели ---
 EMBED_MODEL=BAAI/bge-m3
+EMBED_DEVICE=cpu
 OLLAMA_MODEL=gemma2:9b
 OLLAMA_HOST=http://localhost:11434   # читается приложением; в docker-развёртывании — имя сервиса, а не localhost
+
+# --- Внутренняя аутентификация master -> агент ---
+ENV=dev
+INTERNAL_AUTH_MODE=token
+AGENT_ID=tech_rag
+# per-agent секрет, выданный мастером (master_node AGENT_INTERNAL_TOKENS["tech_rag"])
+MASTER_INTERNAL_TOKEN=<секрет>
 ```
 
 Запуск сервиса:
@@ -81,8 +89,21 @@ uvicorn main:app --host 127.0.0.1 --port 8004 --reload
 
 ```env
 EMBED_MODEL=BAAI/bge-m3
+EMBED_DEVICE=cpu
 OLLAMA_MODEL=qwen3.6:35b
 ```
+
+`EMBED_DEVICE` — устройство для bge-m3 (`cpu`, `cuda`, `cuda:0`, `mps`).
+По умолчанию `cpu`: видеопамять нужна Ollama, а bge-m3 кодирует запрос на
+CPU за ~0.2–0.3 с. Модель загружается лениво, при первом обращении к
+retrieval, поэтому импорт приложения и тесты GPU не занимают.
+
+Предупреждение `You are sending unauthenticated requests to the HF Hub`
+безвредно (при `local_files_only=True` всё равно уходит запрос метаданных)
+и убирается переменной окружения `HF_HUB_OFFLINE=1`.
+
+Как чинить ту же проблему в остальных агентах (двойная загрузка эмбеддера при
+`python main.py --reload`): [guides/embedder-double-load-fix.md](guides/embedder-double-load-fix.md).
 
 ## База данных
 Миграции управляются через Alembic. Применить:
@@ -127,18 +148,21 @@ message_feedback
 
 ## Аутентификация
 
-Сервис не управляет пользователями — это задача платформы (мастер-агент + Keycloak). RAG-ассистент получает UUID пользователя в заголовке `X-User-Id` и использует его как скоуп для своих данных. Заголовок обязателен **во всех** запросах:
+Управление пользователями — задача платформы (мастер-агент + Keycloak). RAG-ассистент не управляет пользователями и не проверяет JWT: он доверяет только мастер-агенту. При каждом запросе мастер передаёт два обязательных заголовка:
 
 ```
-X-User-Id: 11111111-1111-1111-1111-111111111111
+X-User-Id: 11111111-1111-1111-1111-111111111111   # UUID пользователя из проверенного JWT
+X-Internal-Token: <per-agent секрет>              # доказывает, что запрос пришёл от мастера
 ```
 
-JWT валидирует мастер-агент; RAG доверяет внутреннему трафику (сервис должен быть закрыт снаружи в обход мастера). При переходе на валидацию JWT по JWKS Keycloak меняется только `get_user_id`, эндпоинты не затрагиваются.
+`X-Internal-Token` — персональный секрет агента: мастер хранит его в `AGENT_INTERNAL_TOKENS` (`master_node`), а агент — в `.env` (`MASTER_INTERNAL_TOKEN`). Прямой вызов агента без токена или с неверным токеном → `401`: сервис должен быть закрыт снаружи в обход мастера. Роли (`user`/`admin`) проверяет мастер; агент скоупит данные по `X-User-Id`.
+
+Служебный заголовок `X-Request-Id` проходит через мастера и агента и связывает запросы в логах; агент генерирует его сам, если заголовок не передан.
 
 | Ситуация | Код |
 |----------|-----|
-| Заголовок `X-User-Id` отсутствует | `401` |
-| `X-User-Id` не является валидным UUID | `401` |
+| Нет `X-Internal-Token` / неверный | `401` |
+| `X-User-Id` отсутствует или не является валидным UUID | `401` |
 | Обращение к чужому completion'у, чату (`conversation`) или фидбэку | `404` |
 
 Возврат `404` (а не `403`) для чужих объектов сознателен: сервис не подтверждает их существование.
@@ -151,12 +175,12 @@ API состоит из трёх частей:
 - **`/v1/responses`** — форма OpenAI Responses API. Та же генерация, другой формат: объект `response` с массивом `output` вместо `choices`, стрим — типизированными SSE-событиями вместо чанков. В отличие от Chat Completions, умеет работать с историей на стороне сервера: при переданном `conversation` (или `previous_response_id`) историю собирает сам агент из БД.
 - **`/v1/platform/conversations`**, **`.../feedback`**, **`.../sources`** — платформенные (не входящие в OpenAI-стандарт) расширения для UI: список чатов, история сообщений, оценка ответа, извлечённые фрагменты. Связь с формами генерации — поле `conversation_id` в теле запроса и `id` ответа как ключ для фидбэка и источников.
 
-Обе формы совместимы с официальным SDK: `OpenAI(base_url=..., default_headers={"X-User-Id": ...})`, дальше `client.chat.completions.create(...)` или `client.responses.create(...)`. Совместимость с pydantic-моделями `openai-python` должна проверяться conformance-тестами обеих форм (тест подключается отдельно).
+Обе формы совместимы с официальным SDK: `OpenAI(base_url=..., default_headers={"X-Internal-Token": ..., "X-User-Id": ...})`, дальше `client.chat.completions.create(...)` или `client.responses.create(...)`. Совместимость с pydantic-моделями `openai-python` должна проверяться conformance-тестами обеих форм (тест подключается отдельно).
 
 
 ## API
 
-Все эндпоинты требуют заголовок `X-User-Id: <uuid>`. Ресурсы скоупятся по этому идентификатору; обращение к чужому ресурсу возвращает `404`.
+Все эндпоинты (кроме публичного `GET /health`) требуют заголовки `X-Internal-Token: <secret>` и `X-User-Id: <uuid>`. Ресурсы скоупятся по этому идентификатору; обращение к чужому ресурсу возвращает `404`.
 
 ### `POST /v1/chat/completions`
 
@@ -456,21 +480,23 @@ event: response.completed        # объект response со status: "completed
  
 ```bash
 U=11111111-1111-1111-1111-111111111111
+# per-agent секрет мастер-агента; в git его нет — берём из .env
+T=$(sed -n 's/^MASTER_INTERNAL_TOKEN=//p' .env)
  
 # --- генерация, без привязки к чату ---
 curl -k -X POST http://localhost:8004/v1/chat/completions \
-  -H "X-User-Id: $U" -H "Content-Type: application/json" \
+  -H "X-Internal-Token: $T" -H "X-User-Id: $U" -H "Content-Type: application/json" \
   -d '{"model": "tech_rag", "messages": [{"role": "user", "content": "что такое Меры ограничительного характера"}]}'
 # -> {"id": "chatcmpl-...", "object": "chat.completion", "choices": [...], "usage": {...}}
  
 # то же самое, стримом
 curl -k -N -X POST http://localhost:8004/v1/chat/completions \
-  -H "X-User-Id: $U" -H "Content-Type: application/json" \
+  -H "X-Internal-Token: $T" -H "X-User-Id: $U" -H "Content-Type: application/json" \
   -d '{"model": "tech_rag", "stream": true, "messages": [{"role": "user", "content": "что такое РАГ"}]}'
  
 # продолжение диалога — история целиком в теле
 curl -k -X POST http://localhost:8004/v1/chat/completions \
-  -H "X-User-Id: $U" -H "Content-Type: application/json" \
+  -H "X-Internal-Token: $T" -H "X-User-Id: $U" -H "Content-Type: application/json" \
   -d '{"model": "tech_rag", "messages": [
         {"role": "user", "content": "что такое РАГ"},
         {"role": "assistant", "content": "РАГ (Retrieval-Augmented Generation) — это..."},
@@ -480,80 +506,89 @@ curl -k -X POST http://localhost:8004/v1/chat/completions \
 ID=chatcmpl-1e6b7ee7-d5bb-4f0a-8f9e-a06f19a8f3c2
  
 # получить ответ повторно по id (например, если клиент потерял тело исходного ответа)
-curl -k http://localhost:8004/v1/chat/completions/$ID -H "X-User-Id: $U"
+curl -k http://localhost:8004/v1/chat/completions/$ID -H "X-Internal-Token: $T" -H "X-User-Id: $U"
  
 # источники
-curl -k http://localhost:8004/v1/chat/completions/$ID/sources -H "X-User-Id: $U"
+curl -k http://localhost:8004/v1/chat/completions/$ID/sources -H "X-Internal-Token: $T" -H "X-User-Id: $U"
  
 # --- фидбэк ---
  
 # поставить оценку
 curl -k -X POST http://localhost:8004/v1/chat/completions/$ID/feedback \
-  -H "X-User-Id: $U" -H "Content-Type: application/json" \
+  -H "X-Internal-Token: $T" -H "X-User-Id: $U" -H "Content-Type: application/json" \
   -d '{"vote": 1, "comment": "Хороший ответ"}'
  
 # посмотреть текущую оценку
-curl -k http://localhost:8004/v1/chat/completions/$ID/feedback -H "X-User-Id: $U"
+curl -k http://localhost:8004/v1/chat/completions/$ID/feedback -H "X-Internal-Token: $T" -H "X-User-Id: $U"
  
 # сбросить оценку
-curl -k -X DELETE http://localhost:8004/v1/chat/completions/$ID/feedback -H "X-User-Id: $U"
+curl -k -X DELETE http://localhost:8004/v1/chat/completions/$ID/feedback -H "X-Internal-Token: $T" -H "X-User-Id: $U"
  
 # --- чаты (платформенный CRUD) ---
  
 # создать чат
 curl -k -X POST http://localhost:8004/v1/platform/conversations \
-  -H "X-User-Id: $U" -H "Content-Type: application/json" -d '{"title": "Тестовый чат"}'
+  -H "X-Internal-Token: $T" -H "X-User-Id: $U" -H "Content-Type: application/json" -d '{"title": "Тестовый чат"}'
 # -> {"id": "3fa85f64-5717-4562-b3fc-2c963f66afa6", ...}
  
 CID=3fa85f64-5717-4562-b3fc-2c963f66afa6
  
 # сообщение внутри чата — conversation_id привязывает запись к нему
 curl -k -X POST http://localhost:8004/v1/chat/completions \
-  -H "X-User-Id: $U" -H "Content-Type: application/json" \
+  -H "X-Internal-Token: $T" -H "X-User-Id: $U" -H "Content-Type: application/json" \
   -d "{\"model\": \"tech_rag\", \"conversation_id\": \"$CID\", \"messages\": [{\"role\": \"user\", \"content\": \"что такое РАГ\"}]}"
  
 # список чатов
-curl -k http://localhost:8004/v1/platform/conversations -H "X-User-Id: $U"
+curl -k http://localhost:8004/v1/platform/conversations -H "X-Internal-Token: $T" -H "X-User-Id: $U"
  
 # история сообщений чата
-curl -k http://localhost:8004/v1/platform/conversations/$CID/messages -H "X-User-Id: $U"
+curl -k http://localhost:8004/v1/platform/conversations/$CID/messages -H "X-Internal-Token: $T" -H "X-User-Id: $U"
  
 # переименовать / удалить
 curl -k -X PATCH http://localhost:8004/v1/platform/conversations/$CID \
-  -H "X-User-Id: $U" -H "Content-Type: application/json" -d '{"title": "Новое название"}'
-curl -k -X DELETE http://localhost:8004/v1/platform/conversations/$CID -H "X-User-Id: $U"
+  -H "X-Internal-Token: $T" -H "X-User-Id: $U" -H "Content-Type: application/json" -d '{"title": "Новое название"}'
+curl -k -X DELETE http://localhost:8004/v1/platform/conversations/$CID -H "X-Internal-Token: $T" -H "X-User-Id: $U"
  
 # --- ошибки ---
  
-# без X-User-Id -> 401 в едином формате
+# без X-User-Id -> 401 в едином формате (токен при этом валиден)
 curl -k -X POST http://localhost:8004/v1/chat/completions \
-  -H "Content-Type: application/json" -d '{"messages": [{"role": "user", "content": "привет"}]}'
+  -H "X-Internal-Token: $T" -H "Content-Type: application/json" -d '{"messages": [{"role": "user", "content": "привет"}]}'
 # -> {"error": {"message": "...", "type": "authentication_error", "param": null, "code": null}}
  
 # чужой/несуществующий completion_id -> 404
 curl -k http://localhost:8004/v1/chat/completions/chatcmpl-00000000-0000-0000-0000-000000000000/sources \
-  -H "X-User-Id: $U"
+  -H "X-Internal-Token: $T" -H "X-User-Id: $U"
 # -> {"error": {"message": "Сообщение не найдено", "type": "not_found_error", "param": null, "code": null}}
  
 # --- форма Responses ---
 curl -k -X POST http://localhost:8004/v1/responses \
-  -H "X-User-Id: $U" -H "Content-Type: application/json" \
+  -H "X-Internal-Token: $T" -H "X-User-Id: $U" -H "Content-Type: application/json" \
   -d '{"model": "tech_rag", "input": "что такое РАГ"}'
 
 # продолжение цепочки стандартным способом
 RID=$(curl -sk -X POST http://localhost:8004/v1/responses \
-  -H "X-User-Id: $U" -H "Content-Type: application/json" \
+  -H "X-Internal-Token: $T" -H "X-User-Id: $U" -H "Content-Type: application/json" \
   -d "{\"conversation\": \"$CID\", \"input\": \"что такое РАГ\"}" | jq -r .id)
 curl -k -X POST http://localhost:8004/v1/responses \
-  -H "X-User-Id: $U" -H "Content-Type: application/json" \
+  -H "X-Internal-Token: $T" -H "X-User-Id: $U" -H "Content-Type: application/json" \
   -d "{\"previous_response_id\": \"$RID\", \"input\": \"а какие сроки\"}"
 
 # удаление ответа (фидбэк уходит каскадом)
-curl -k -X DELETE http://localhost:8004/v1/responses/$RID -H "X-User-Id: $U"
+curl -k -X DELETE http://localhost:8004/v1/responses/$RID -H "X-Internal-Token: $T" -H "X-User-Id: $U"
 # -> {"id": "resp_...", "object": "response.deleted", "deleted": true}
 
 # пустой messages -> 400
 curl -k -X POST http://localhost:8004/v1/chat/completions \
-  -H "X-User-Id: $U" -H "Content-Type: application/json" -d '{"messages": []}'
+  -H "X-Internal-Token: $T" -H "X-User-Id: $U" -H "Content-Type: application/json" -d '{"messages": []}'
 # -> {"error": {"message": "messages обязателен и не должен быть пустым", "type": "invalid_request_error", "param": null, "code": null}}
+
+# --- ops ---
+# liveness публичный, без токена
+curl -k http://localhost:8004/health
+# -> {"status": "ok"}
+
+# readiness с зависимостями — под токеном
+curl -k http://localhost:8004/health/ready -H "X-Internal-Token: $T"
+# -> {"status": "ready", "postgres": true, "qdrant": true, "collection": true, "ollama": true, "bm25": true}
 ```

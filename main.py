@@ -12,6 +12,8 @@ from app.api.feedback import router as feedback_router
 from app.api.sources import router as sources_router
 from app.api.conversations import router as conversations_router
 from app.api.health import router as health_router
+from app.core.config import settings
+from app.core.security import install_internal_auth
 
 
 @asynccontextmanager
@@ -19,11 +21,14 @@ async def lifespan(app: FastAPI):
     yield
 
 
+_is_prod = settings.ENV == "prod"
+
 app = FastAPI(
     title="TechDocs RAG Agent API",
     version="0.1.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
+    docs_url=None if _is_prod else "/docs",
+    redoc_url=None if _is_prod else "/redoc",
+    openapi_url=None if _is_prod else "/openapi.json",
     lifespan=lifespan,
 )
 
@@ -35,6 +40,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Внутренняя аутентификация master -> агент. Должна идти до роутеров.
+install_internal_auth(app, settings)
 
 
 app.include_router(chat_router)
