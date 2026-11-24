@@ -106,13 +106,14 @@ def index_documents(
     input_dir:       Path,
     collection_name: str,
     model_name:      str,
+    device:          str,
     chunk_size:      int,
     chunk_overlap:   int,
     reset:           bool,
 ) -> None:
-    print(f"Загрузка модели: {model_name}")
-    embedder = SentenceTransformer(model_name)
-    vector_size = embedder.get_sentence_embedding_dimension()
+    print(f"Загрузка модели: {model_name} (device={device})")
+    embedder = SentenceTransformer(model_name, device=device)
+    vector_size = embedder.get_embedding_dimension()
 
     client = QdrantClient(
         url=settings.qdrant_url,
@@ -148,6 +149,8 @@ def main() -> None:
     parser.add_argument("--input_dir",     required=True, type=Path)
     parser.add_argument("--collection",    default=settings.QDRANT_COLLECTION)
     parser.add_argument("--model",         default=settings.EMBED_MODEL)
+    parser.add_argument("--device",        default=settings.EMBED_DEVICE,
+                        help="cpu | cuda | cuda:0 (по умолчанию из EMBED_DEVICE)")
     parser.add_argument("--chunk_size",    type=int, default=DEFAULT_CHUNK_SIZE)
     parser.add_argument("--chunk_overlap", type=int, default=DEFAULT_CHUNK_OVERLAP)
     parser.add_argument("--reset",         action="store_true",
@@ -158,6 +161,7 @@ def main() -> None:
         input_dir=args.input_dir,
         collection_name=args.collection,
         model_name=args.model,
+        device=args.device,
         chunk_size=args.chunk_size,
         chunk_overlap=args.chunk_overlap,
         reset=args.reset,

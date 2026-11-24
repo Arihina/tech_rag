@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import threading
 
 import numpy as np
 from qdrant_client import QdrantClient, models
@@ -13,7 +14,7 @@ from app.core.config import settings
 QDRANT_COLLECTION = settings.QDRANT_COLLECTION
 EMBED_MODEL = settings.EMBED_MODEL
 
-# Используем только bge (bge-m3): префиксов query:/passage: bge не требует.
+
 RETRIEVAL_THRESHOLD = 0.35
 RETRIEVAL_TOP_K = 10
 RRF_K = 60
@@ -30,12 +31,14 @@ CHUNK_TYPE_BOOST: dict[str, float] = {
 type DocResult = dict
 
 
-embed_model = SentenceTransformer(EMBED_MODEL, local_files_only=True)
 qdrant_client = QdrantClient(
     url=settings.qdrant_url,
     api_key=settings.QDRANT_API_KEY,
     prefer_grpc=settings.QDRANT_PREFER_GRPC,
 )
+
+_embed_model: SentenceTransformer | None = None
+_embed_lock = threading.Lock()
 
 documents: list[str] = []
 metadatas: list[dict] = []
@@ -54,7 +57,25 @@ def _enrich_text(text: str, meta: dict) -> str:
     return text
 
 
-def _validate_dimension() -> None:
+def get_embed_model() -> SentenceTransformer:
+    """Ленивая загрузка эмбеддера (один раз на процесс, потокобезопасно)."""
+    global _embed_model
+
+    if _embed_model is not None:
+        return _embed_model
+
+    with _embed_lock:
+        if _embed_model is None:
+            _embed_model = SentenceTransformer(
+                EMBED_MODEL,
+                device=settings.EMBED_DEVICE or None,
+                local_files_only=True,
+            )
+            _validate_dimension(_embed_model)
+    return _embed_model
+
+
+def _validate_dimension(model: SentenceTransformer) -> None:
     """Fail-fast при несовпадении размерности коллекции и модели.
 
     Несовпадение (например, индекс построен моделью с размерностью 384, а
@@ -70,7 +91,7 @@ def _validate_dimension() -> None:
         size = getattr(vectors, "size", None)
         if size is None:
             return
-        model_dim = int(embed_model.get_sentence_embedding_dimension())
+        model_dim = int(model.get_embedding_dimension())
         if size != model_dim:
             raise RuntimeError(
                 f"Коллекция '{QDRANT_COLLECTION}' имеет размерность {size}, "
@@ -121,7 +142,6 @@ def _load_corpus() -> None:
 def _init_bm25() -> None:
     global bm25
 
-    _validate_dimension()
     _load_corpus()
 
     if documents:
@@ -204,8 +224,10 @@ def _bm25_search(query: str, top_k: int = RETRIEVAL_TOP_K) -> list[DocResult]:
 
 
 def _vector_search(query: str, top_k: int = RETRIEVAL_TOP_K) -> list[DocResult]:
+    model = get_embed_model()
+
     try:
-        embedding = embed_model.encode(
+        embedding = model.encode(
             [query],
             convert_to_numpy=True,
             normalize_embeddings=True,
